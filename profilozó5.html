@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rendőrségi Profilozó Rendszer (RPS) V7</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <script>
+        // Tailwind konfiguráció az Inter font és a színek miatt
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                    colors: {
+                        'rps-dark': '#0f172a',    /* Sötét Kék Alap (Slate 900) */
+                        'rps-light': '#f8fafc',   /* Fehér Alap (Slate 50) */
+                        'rps-accent': '#3b82f6',  /* Elsődleges Kék (Blue 500) */
+                        'rps-danger': '#ef4444',  /* Piros (Red 500) */
+                        'rps-success': '#10b981', /* Zöld (Emerald 500) */
+                        'rps-warn': '#f59e0b',    /* Sárga (Amber 500) */
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        /* Egyedi stílusok a professzionális megjelenéshez */
+        body { background-color: #0f172a; }
+        .rps-card {
+            background: #1e293b; /* Slate 800 */
+            border-left: 5px solid var(--accent-color, #3b82f6);
+            border-radius: 0.75rem; /* rounded-xl */
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        .rps-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 15px 30px rgba(0, 0, 0, 0.6);
+        }
+        .input-field, .textarea-field {
+            background-color: #0f172a; /* Slate 900 */
+            color: #f8fafc;
+            border: 1px solid #334155; /* Slate 700 */
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        .input-field:focus, .textarea-field:focus {
+            border-color: #3b82f6;
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.5);
+        }
+        .btn-primary {
+            background-color: var(--accent-color, #3b82f6);
+            transition: background-color 0.2s, transform 0.2s, opacity 0.2s;
+        }
+        .btn-primary:hover:not(:disabled) {
+            background-color: #60a5fa;
+            transform: translateY(-1px);
+        }
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .accent-danger { --accent-color: #ef4444; }
+        .accent-success { --accent-color: #10b981; }
+        .accent-warn { --accent-color: #f59e0b; }
+
+        .progress-bar {
+            height: 12px;
+            border-radius: 9999px;
+            overflow: hidden;
+            background-color: #334155;
+        }
+        .progress-fill {
+            transition: width 0.5s ease-out;
+        }
+
+        /* Térkép stílusok */
+        #mapContainer {
+            position: relative;
+            min-height: 400px;
+            overflow: hidden;
+            border-radius: 0.5rem;
+            border: 2px solid #334155;
+        }
+        #mapImage {
+            width: 100%;
+            height: auto;
+            display: block;
+            opacity: 0.7; /* Kis átlátszóság a "kivetítés" hatásért */
+        }
+        .projection-point {
+            position: absolute;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background-color: #ef4444; /* Piros pontok */
+            box-shadow: 0 0 8px #ef4444, 0 0 4px #f8fafc;
+            transform: translate(-50%, -50%);
+            transition: all 0.3s ease-out;
+            cursor: pointer;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body class="p-4 sm:p-8 min-h-screen text-rps-light">
+
+    <!-- Globális Állapot és LLM Konfiguráció -->
+    <script>
+        // A generált személyazonosságok tárolása a KÖE funkció számára
+        window.currentIdentities = []; 
+
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        // LLM API konfiguráció
+        const apiKey = ""; // API Kulcs automatikusan biztosítva futás közben
+        const modelName = "gemini-2.5-flash-preview-09-2025";
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+
+        /**
+         * Segédfüggvény: Exponenciális visszalépéses fetch
+         */
+        async function exponentialBackoffFetch(url, options, retries = 5, delay = 1000) {
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.status === 429 && i < retries - 1) {
+                        console.warn(`Rate limit reached. Retrying in ${delay}ms...`);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        delay *= 2;
+                        continue;
+                    }
+                    if (!response.ok) {
+                        const errorBody = await response.text();
+                        throw new Error(`HTTP Error! Status: ${response.status}. Response: ${errorBody}`);
+                    }
+                    return response;
+                } catch (error) {
+                    if (i === retries - 1) {
+                        throw error;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    delay *= 2;
+                }
+            }
+        }
+        
+        /**
+         * 1. Funkció: Súlyossági Pontszám Kiszámítása (S_T)
+         */
+        window.calculateSeverityScore = function() {
+            const crimeType = document.getElementById('crimeType').value.trim().toLowerCase();
+            const severityDisplay = document.getElementById('severityDisplay');
+            const severityText = document.getElementById('severityText');
+            const severityFill = document.getElementById('severityFill');
+            const severityInput = document.getElementById('severityInput');
+            
+            let score = 1.0;
+            let description = "Semleges";
+            let color = 'bg-rps-success';
+
+            // Kategorizálás a bűncselekmény típusa alapján
+            if (crimeType.includes('emberölés') || crimeType.includes('terror') || crimeType.includes('kizsákmányolás')) {
+                score = 9.5;
+                description = "Kritikus Kockázat (S_T: 9.5)";
+                color = 'bg-rps-danger';
+            } else if (crimeType.includes('rablás') || crimeType.includes('zsarolás') || crimeType.includes('erőszak')) {
+                score = 7.8;
+                description = "Magas Kockázat (S_T: 7.8)";
+                color = 'bg-rps-danger';
+            } else if (crimeType.includes('betörés') || crimeType.includes('lopás') || crimeType.includes('csalás')) {
+                score = 5.5;
+                description = "Közepes Kockázat (S_T: 5.5)";
+                color = 'bg-rps-warn';
+            } else if (crimeType.includes('rendbontás') || crimeType.includes('rongálás')) {
+                score = 3.0;
+                description = "Alacsony Kockázat (S_T: 3.0)";
+                color = 'bg-rps-success';
+            } else if (crimeType.includes('eltűnt')) {
+                 score = 6.5;
+                description = "Közepes/Magas Kockázat (Eltűnés) (S_T: 6.5)";
+                color = 'bg-rps-warn';
+            }
+
+            // Frissítés
+            const percentage = (score / 10.0) * 100;
+            severityFill.style.width = `${percentage}%`;
+            severityFill.className = `progress-fill h-full ${color}`;
+            severityText.textContent = description;
+            
+            // Rejtett input frissítése, amit az LLM funkciók használnak
+            severityInput.value = score.toFixed(1);
+        }
+
+        /**
+         * 3. Elem: Potenciális Személyazonosságok Generálása (PID)
+         */
+        window.generatePotentialIdentities = async function() {
+            const caseDescription = document.getElementById('caseDescription').value.trim();
+            const severity = document.getElementById('severityInput').value.trim();
+            const caseName = document.getElementById('caseName').value.trim() || "Ismeretlen Elkövető";
+            const idResultsPanel = document.getElementById('idResultsPanel');
+            const identitiesTableBody = document.getElementById('identitiesTableBody');
+            const idStatusMessage = document.getElementById('idStatusMessage');
+            const generateIdButton = document.getElementById('generateIdButton');
+            const idIcon = document.getElementById('idIcon');
+            const idLoadingIcon = document.getElementById('idLoadingIcon');
+
+            if (!caseDescription || !severity) {
+                idStatusMessage.textContent = "Kérem, adja meg az eseti összefoglalót és a bűncselekmény jellegét!";
+                idResultsPanel.classList.remove('hidden');
+                return;
+            }
+
+            // UI frissítése betöltésre
+            generateIdButton.disabled = true;
+            idIcon.classList.add('hidden');
+            idLoadingIcon.classList.remove('hidden');
+            idStatusMessage.textContent = "A potenciális személyazonosságok generálása folyamatban van...";
+            idResultsPanel.classList.remove('hidden');
+            identitiesTableBody.innerHTML = '';
+            window.currentIdentities = []; 
+
+            const systemPrompt = `Ön egy Rendőrségi Profilozó Rendszer (RPS) személyazonosság-generáló egysége (PID). Az Ön feladata, hogy a megadott esetprofil és ${caseName} elnevezésű célpont adatai alapján generáljon 5 valószínűsíthető lehetséges személyazonosságot (név, születési dátum) a célpont számára. A születési dátumokat YYYY.MM.DD formában adja meg, reális életkornak megfelelően. Minden egyes generált identitás mellé adjon egy rövid, szakmai indoklást a profil alapján.`;
+            const userQuery = `Az esetprofil a következő: "${caseDescription}". A kockázati pontszám (S_T) ${severity}. Generáljon 5 lehetséges nevet, születési dátumot és rövid indoklást ehhez a profilhoz.`;
+            
+            const responseSchema = {
+                type: "ARRAY",
+                items: {
+                    type: "OBJECT",
+                    properties: {
+                        "name": { "type": "STRING", "description": "Teljes név (pl. vezeték- és utónév). Magyar név használata javasolt, ha a profil nem utal másra." },
+                        "dob": { "type": "STRING", "description": "Születési dátum YYYY.MM.DD formátumban." },
+                        "rationale": { "type": "STRING", "description": "A név és dátum lehetséges okának rövid magyarázata a profil alapján." }
+                    },
+                    required: ["name", "dob", "rationale"]
+                }
+            };
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: responseSchema
+                },
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+            };
+
+            try {
+                const response = await exponentialBackoffFetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                let jsonResponseText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                if (!jsonResponseText) {
+                    throw new Error("Az LLM nem adott vissza strukturált választ.");
+                }
+
+                const identities = JSON.parse(jsonResponseText);
+
+                if (Array.isArray(identities) && identities.length > 0) {
+                    // SIKER: Adatok tárolása a KÖE funkcióhoz
+                    window.currentIdentities = identities;
+
+                    identitiesTableBody.innerHTML = identities.map((item, index) => `
+                        <tr class="hover:bg-gray-700 transition duration-150">
+                            <td class="px-4 py-2 text-sm font-medium text-rps-light">${item.name || 'N/A'}</td>
+                            <td class="px-4 py-2 text-sm text-rps-success">${item.dob || 'N/A'}</td>
+                            <td class="px-4 py-2 text-sm text-gray-400 hidden lg:table-cell">${item.rationale || 'N/A'}</td>
+                        </tr>
+                    `).join('');
+                    idStatusMessage.textContent = `Sikeresen generálva ${identities.length} potenciális személyazonosság.`;
+                    idStatusMessage.classList.remove('text-rps-danger');
+                    idStatusMessage.classList.add('text-rps-success');
+
+                } else {
+                    idStatusMessage.textContent = "A generálás sikeres, de nem kaptunk érvényes lista adatot.";
+                }
+
+            } catch (error) {
+                console.error("PID Generálási hiba:", error);
+                idStatusMessage.textContent = `Hiba történt a generálás során: ${error.message}.`;
+                idStatusMessage.classList.remove('text-rps-success');
+                idStatusMessage.classList.add('text-rps-danger');
+                identitiesTableBody.innerHTML = '';
+            } finally {
+                // UI visszaállítása
+                generateIdButton.disabled = false;
+                idIcon.classList.remove('hidden');
+                idLoadingIcon.classList.add('hidden');
+            }
+        }
+
+
+        /**
+         * 4. Elem: Kvantum-Kivetítési Pontok Generálása (ESzK)
+         */
+        window.generateProjectionPoints = async function() {
+            const caseDescription = document.getElementById('caseDescription').value.trim();
+            const caseLocation = document.getElementById('caseLocation').value.trim();
+            const severity = document.getElementById('severityInput').value.trim();
+            const projectionTable = document.getElementById('projectionTable');
+            const projectionButton = document.getElementById('projectionButton');
+            const projectionIcon = document.getElementById('projectionIcon');
+            const projectionLoadingIcon = document.getElementById('projectionLoadingIcon');
+            const mapContainer = document.getElementById('mapContainer');
+
+            if (!caseDescription || !caseLocation) {
+                projectionTable.innerHTML = `<p class="text-rps-danger">Kérem, adja meg az eseti összefoglalót és a helyszínt a kivetítéshez!</p>`;
+                return;
+            }
+
+            // UI frissítése betöltésre
+            projectionButton.disabled = true;
+            projectionIcon.classList.add('hidden');
+            projectionLoadingIcon.classList.remove('hidden');
+            projectionTable.innerHTML = `<p class="text-gray-400 text-center">Circle-Logos kvantumhely megállapítás folyamatban...</p>`;
+            mapContainer.innerHTML = `<img id="mapImage" src="https://placehold.co/600x400/0f172a/64748b?text=TERKEP+HELYORZO" alt="Helyőrző Képernyő" style="width: 100%; height: 100%; object-fit: cover;">`; // Visszaállítja a képet
+
+            const systemPrompt = `Ön egy Rendőrségi Profilozó Rendszer Kvantum-Kivetítő egysége (ESzK). A feladata, hogy a megadott esetprofil (${caseDescription}), a helyszín (${caseLocation}) és a súlyosság (${severity}) alapján 5 fiktív, de logikailag releváns GPS koordinátát (latitude, longitude) generáljon, amelyek a legvalószínűbb tartózkodási kvantumpontokat és a következő lehetséges bűncselekmény helyszínét jelölik. A koordinátáknak a megadott helyszínhez közeli, reális értékeknek kell lenniük. Például, ha Budapest szerepel, budapesti koordinátákat generáljon.`;
+
+            const userQuery = `Az esetprofil a következő: "${caseDescription}". Helyszín: ${caseLocation}. Kockázati Pontszám (S_T): ${severity}. Generáljon 5 fiktív, de valószínű koordinátát (latitude, longitude), zóna-címkét (pl. 'Tartózkodási Kvantumpont I') és rövid indoklást ehhez a profilhoz.`;
+            
+            const responseSchema = {
+                type: "ARRAY",
+                items: {
+                    type: "OBJECT",
+                    properties: {
+                        "lat": { "type": "NUMBER", "description": "Fiktív szélességi koordináta, tizedes tört formában (4 tizedes pontosság)." },
+                        "lng": { "type": "NUMBER", "description": "Fiktív hosszúsági koordináta, tizedes tört formában (4 tizedes pontosság)." },
+                        "zone_label": { "type": "STRING", "description": "A kivetített zóna címe (pl. 'Magas Valószínűségű Zóna A')." },
+                        "reason": { "type": "STRING", "description": "Rövid magyarázat a kivetítés okára." }
+                    },
+                    required: ["lat", "lng", "zone_label", "reason"]
+                }
+            };
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: responseSchema
+                },
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+            };
+
+            try {
+                const response = await exponentialBackoffFetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                let jsonResponseText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                if (!jsonResponseText) {
+                    throw new Error("Az LLM nem adott vissza strukturált válasz koordinátákat.");
+                }
+
+                const locations = JSON.parse(jsonResponseText);
+
+                if (Array.isArray(locations) && locations.length > 0) {
+                    
+                    // 1. Táblázat frissítése
+                    projectionTable.innerHTML = `
+                        <table class="min-w-full divide-y divide-gray-700 rounded-lg overflow-hidden">
+                            <thead class="bg-gray-700">
+                                <tr>
+                                    <th class="px-4 py-2 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Zóna (Valószínűség)</th>
+                                    <th class="px-4 py-2 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Koordináták (Fiktív)</th>
+                                    <th class="px-4 py-2 text-left text-xs font-medium text-gray-300 uppercase tracking-wider hidden sm:table-cell">Indoklás</th>
+                                </tr>
+                            </thead>
+                            <tbody class="bg-gray-800 divide-y divide-gray-700">
+                                ${locations.map(item => `
+                                    <tr class="hover:bg-gray-700 transition duration-150">
+                                        <td class="px-4 py-2 text-sm font-medium text-rps-light">${item.zone_label || 'N/A'}</td>
+                                        <td class="px-4 py-2 text-sm text-rps-warn">${item.lat.toFixed(4)}, ${item.lng.toFixed(4)}</td>
+                                        <td class="px-4 py-2 text-sm text-gray-400 hidden sm:table-cell">${item.reason || 'N/A'}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    `;
+                    
+                    // 2. Térkép Kép Kivetítése és Pontok Rajzolása
+                    const mapImgUrl = `https://placehold.co/600x400/0f172a/64748b?text=Kivetitesi+Terulet:+${encodeURIComponent(caseLocation)}`;
+                    mapContainer.innerHTML = `<img id="mapImage" src="${mapImgUrl}" alt="Kivetítési Terület Helyőrző" style="width: 100%; height: 100%; object-fit: cover;">`;
+                    
+                    // Pontok rajzolása a képre (fiktív, a pontok a koordináták alapján generált véletlen pozíciók)
+                    locations.forEach((location, index) => {
+                        // Véletlen, de determinisztikus pozíció a képen (0-100% között)
+                        // A fiktív pontok a kép különböző részeire kerülnek, csak a vizuális hatás kedvéért
+                        const seed = (location.lat * 1000 + location.lng * 1000) % 100;
+                        const left = (30 + (seed * 0.4)) % 80;
+                        const top = (30 + (seed * 0.6) + index * 5) % 80;
+
+                        const point = document.createElement('div');
+                        point.className = 'projection-point';
+                        point.style.left = `${left}%`;
+                        point.style.top = `${top}%`;
+                        point.title = `${location.zone_label} (${location.lat.toFixed(4)}, ${location.lng.toFixed(4)})`;
+
+                        mapContainer.appendChild(point);
+                    });
+
+                } else {
+                    projectionTable.innerHTML = `<p class="text-rps-danger">A kivetítés sikeres, de nem kaptunk érvényes koordináta adatokat.</p>`;
+                    mapContainer.innerHTML = `<img id="mapImage" src="https://placehold.co/600x400/0f172a/64748b?text=TERKEP+HELYORZO" alt="Helyőrző Képernyő" style="width: 100%; height: 100%; object-fit: cover;">`;
+                }
+
+            } catch (error) {
+                console.error("Kivetítési hiba:", error);
+                projectionTable.innerHTML = `<p class="text-rps-danger">Kritikus hiba a kvantumpontok generálása során: ${error.message}.</p>`;
+            } finally {
+                // UI visszaállítása
+                projectionButton.disabled = false;
+                projectionIcon.classList.remove('hidden');
+                projectionLoadingIcon.classList.add('hidden');
+            }
+        }
+        
+        /**
+         * 5. Elem: Kapcsolat- és Összehasonlító Elemzés (KÖE)
+         */
+        window.generateComparisonAnalysis = async function() {
+            const caseDescription = document.getElementById('caseDescription').value.trim();
+            const caseName = document.getElementById('caseName').value.trim() || "Ismeretlen Elkövető";
+            const comparisonResultsPanel = document.getElementById('comparisonResultsPanel');
+            const comparisonStatusMessage = document.getElementById('comparisonStatusMessage');
+            const comparisonButton = document.getElementById('comparisonButton');
+            const comparisonIcon = document.getElementById('comparisonIcon');
+            const comparisonLoadingIcon = document.getElementById('comparisonLoadingIcon');
+
+            if (!caseDescription) {
+                comparisonStatusMessage.textContent = "Kérem, adja meg az eseti összefoglalót a kapcsolati elemzéshez!";
+                comparisonResultsPanel.classList.remove('hidden');
+                comparisonResultsPanel.innerHTML = '';
+                return;
+            }
+            
+            const identities = window.currentIdentities;
+            if (!identities || identities.length === 0) {
+                comparisonStatusMessage.textContent = "Először generáljon potenciális személyazonosságokat a 3. pontban (PID)!";
+                comparisonStatusMessage.classList.remove('text-rps-success');
+                comparisonStatusMessage.classList.add('text-rps-danger');
+                comparisonResultsPanel.classList.remove('hidden');
+                comparisonResultsPanel.innerHTML = '';
+                return;
+            }
+
+            // UI frissítése betöltésre
+            comparisonButton.disabled = true;
+            comparisonIcon.classList.add('hidden');
+            comparisonLoadingIcon.classList.remove('hidden');
+            comparisonResultsPanel.classList.remove('hidden');
+            comparisonStatusMessage.textContent = "Kapcsolat-elemzés és összehasonlítás folyamatban...";
+            comparisonResultsPanel.innerHTML = `<p class="text-center text-gray-500">Elemzés generálása...</p>`;
+
+            // Adatok előkészítése a prompt számára
+            const identityList = identities.map(i => `Név: ${i.name}, Születési Dátum: ${i.dob}, Racionálé: ${i.rationale}`).join('\n- ');
+
+            const systemPrompt = `Ön egy Rendőrségi Profilozó Rendszer Kapcsolat- és Összehasonlító Elemző egysége (KÖE). Az Ön feladata, hogy a megadott eseti profil (${caseDescription}) és az alábbi 5 generált potenciális személyazonosság (PID) alapján egy szöveges, elemző jelentést készítsen. A jelentésnek tartalmaznia kell: 1) A PID-ek közötti lehetséges kapcsolati mintákat (pl. hasonló életkor/háttér, ha van), 2) Összehasonlítást a PID-ek és az eredeti eseti profil között (melyik illeszkedik a legjobban?), és 3) Egy végleges szakmai következtetést arról, hogy melyik PID a legvalószínűbb célpont. Ne használjon Markdown formázást a válaszban (pl. *-ok, **-ok). A válaszban használjon magyar nyelvet.`;
+            
+            const userQuery = `Eseti Profil: "${caseDescription}". Célpont Név: ${caseName}. Potenciális Személyazonosságok (PID-ek):\n- ${identityList}\n\nA fenti adatok alapján végezze el az elemzést a megadott utasítások szerint.`;
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+            };
+
+            try {
+                const response = await exponentialBackoffFetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                const analysisText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                if (!analysisText) {
+                    throw new Error("Az LLM nem adott vissza elemző szöveget.");
+                }
+
+                comparisonResultsPanel.innerHTML = `
+                    <div class="p-4 bg-gray-900 rounded-lg text-gray-300 whitespace-pre-wrap leading-relaxed">
+                        <h4 class="text-lg font-bold text-rps-accent mb-3">Elemzés Eredménye:</h4>
+                        ${analysisText.replace(/\n/g, '<br>')}
+                    </div>
+                `;
+                comparisonStatusMessage.textContent = `Kapcsolat- és Összehasonlító Elemzés kész.`;
+                comparisonStatusMessage.classList.remove('text-rps-danger');
+                comparisonStatusMessage.classList.add('text-rps-success');
+
+            } catch (error) {
+                console.error("KÖE Generálási hiba:", error);
+                comparisonStatusMessage.textContent = `Hiba történt a kapcsolati elemzés során: ${error.message}.`;
+                comparisonStatusMessage.classList.remove('text-rps-success');
+                comparisonStatusMessage.classList.add('text-rps-danger');
+                comparisonResultsPanel.innerHTML = '';
+            } finally {
+                // UI visszaállítása
+                comparisonButton.disabled = false;
+                comparisonIcon.classList.remove('hidden');
+                comparisonLoadingIcon.classList.add('hidden');
+            }
+        }
+
+        // Segédfüggvény: Inputok generálása (helyőrző) - A 2. pont most már csak a mátrix paramétereket mutatja be.
+        function generatePsiMatrixInputs(containerId) {
+            const container = document.getElementById(containerId);
+            if (!container) return;
+
+            const inputLabels = [
+                "C1 (Motiváció)", 
+                "C2 (Szervezettség)", 
+                "C3 (Jellembeli Eltérés)", 
+                "C4 (Kronológiai Tényező)", 
+                "C5 (Geométeriai Eltérés)", 
+                "C6 (Reakcióidő)"
+            ];
+
+            let html = '<div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3 justify-center text-sm">';
+            inputLabels.forEach((label, index) => {
+                html += `
+                    <div class="flex flex-col items-center p-2 bg-gray-700 rounded-lg">
+                        <label class="text-gray-300 text-xs mb-1">${label}</label>
+                        <input type="number" value="0.${index + 1}" step="0.01" min="0" max="1" class="input-field rounded p-1 text-xs w-full text-center">
+                    </div>
+                `;
+            });
+            html += '</div>';
+            container.innerHTML = html;
+        }
+
+
+        // Inicializálás
+        document.addEventListener('DOMContentLoaded', () => {
+            generatePsiMatrixInputs('psiMatrixContainer');
+            window.calculateSeverityScore(); // Kezdeti S_T pontszám beállítása
+
+            // Kezdeti üzenet a térkép konténerben
+            const mapContainer = document.getElementById('mapContainer');
+            mapContainer.innerHTML = `
+                <div class="p-6 text-center text-gray-500 flex flex-col items-center justify-center h-full">
+                    <svg class="w-12 h-12 text-rps-accent mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                    <p class="text-lg font-semibold mb-2">A Kvantumpontok Vizuális Kivetítése (ESzK)</p>
+                    <p class="text-sm">Nyomja meg a gombot a "Circle-Logos" elvei alapján generált fiktív koordináták megtekintéséhez.</p>
+                </div>
+            `;
+            // Kezdeti üzenet a KÖE panelben
+             document.getElementById('comparisonStatusMessage').textContent = "Várja a 3. pontban generált PID adatokra.";
+        });
+
+    </script>
+
+    <div id="app" class="w-full max-w-6xl mx-auto space-y-8">
+        <header class="text-center py-6">
+            <h1 class="text-4xl sm:text-5xl font-extrabold text-rps-light mb-2 tracking-wider">
+                RENDŐRSÉGI PROFILOZÓ RENDSZER (RPS)
+            </h1>
+            <p class="text-gray-400 text-xl font-medium">Kvanti-Fizikai Profilozó (KFP) Munkamenet</p>
+        </header>
+
+        <!-- 1. Cél Profil Adatok és Súlyossági Mérés -->
+        <div class="rps-card rounded-xl p-6 sm:p-8" style="--accent-color: #3b82f6;">
+            <h2 class="text-3xl font-bold text-rps-light mb-6">1. Eseti & Bemeneti Adatok</h2>
+            
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+                <!-- Név / Elkövető -->
+                <div class="lg:col-span-1">
+                    <label for="caseName" class="block text-sm font-medium text-gray-300 mb-1">Célpont Név / Eset Azonosító</label>
+                    <input id="caseName" type="text" class="input-field w-full p-3 rounded-lg" placeholder="Pl.: Fenyvesi Zsolt / X-14/B esetszám">
+                </div>
+                <!-- Bűncselekmény típusa -->
+                <div>
+                    <label for="crimeType" class="block text-sm font-medium text-gray-300 mb-1">Bűncselekmény Súlya / Jellege</label>
+                    <input id="crimeType" type="text" oninput="calculateSeverityScore()" class="input-field w-full p-3 rounded-lg" placeholder="Pl.: Betörés, Emberölés, Eltűnt személy">
+                    <p class="text-xs text-gray-500 mt-1">Az S_T pontszám automatikusan frissül a beírás alapján.</p>
+                </div>
+                <!-- Helyszín -->
+                <div>
+                    <label for="caseLocation" class="block text-sm font-medium text-gray-300 mb-1">Helyszín / Utolsó Ismert Tartózkodási Hely</label>
+                    <input id="caseLocation" type="text" class="input-field w-full p-3 rounded-lg" placeholder="Pl.: Budapest, Zugló, Árpád utca">
+                </div>
+            </div>
+
+            <!-- Eseti Összefoglaló -->
+            <div class="mb-8">
+                <label for="caseDescription" class="block text-sm font-medium text-gray-300 mb-1">Eseti Profil Összefoglaló (Bemenet az LLM modulokhoz)</label>
+                <textarea id="caseDescription" rows="4" class="textarea-field w-full p-3 rounded-lg resize-none" placeholder="Pl.: Férfi, 20-30 év, magasan képzett, szervezett, pénzügyi motiváció. Az elkövetés dátuma: 2024.10.21. A sértett idősebb nő."></textarea>
+            </div>
+            
+            <!-- Súlyossági Mérő -->
+            <div class="bg-gray-800 p-4 rounded-lg">
+                <div class="flex justify-between items-center mb-2">
+                    <span class="text-lg font-bold text-rps-light">Kockázati Pontszám (S_T) Elemzés:</span>
+                    <span id="severityText" class="text-lg font-bold text-rps-warn">Közepes Kockázat (S_T: 5.5)</span>
+                </div>
+                <div class="progress-bar">
+                    <div id="severityFill" class="progress-fill h-full bg-rps-warn" style="width: 55%;"></div>
+                </div>
+                <!-- Rejtett input az LLM funkciókhoz -->
+                <input id="severityInput" type="hidden" value="5.5">
+            </div>
+        </div>
+
+        <!-- 2. PSI Mátrix Generátor (Helyőrző) -->
+        <div class="rps-card rounded-xl p-6 sm:p-8" style="--accent-color: #f59e0b;">
+            <h2 class="text-3xl font-bold text-rps-light mb-6">2. Ψ (PSI) Mátrix Paraméterek (Bemeneti Tényezők)</h2>
+            <p class="text-gray-400 mb-6">
+                A Kvanti-Fizikai Képlet (KFK) bemeneti együtthatói. Ezek a paraméterek súlyozzák a Kvantum-Kivetítést (ESzK).
+            </p>
+            <div id="psiMatrixContainer" class="flex flex-wrap gap-4 justify-center">
+                <!-- A PSI mátrix inputok ide kerülnek a JS-ből -->
+            </div>
+            <div class="text-center mt-8">
+                <button class="btn-primary text-rps-light font-bold py-3 px-8 rounded-lg" style="--accent-color: #f59e0b;">
+                    Ψ Mátrix Kalibrálása és Rögzítése
+                </button>
+            </div>
+        </div>
+        
+        <!-- 3. Potenciális Személyazonosság Generátor (PID) -->
+        <div class="rps-card accent-success rounded-xl p-6 sm:p-8">
+            <h2 class="text-3xl font-bold text-rps-light mb-6">3. Potenciális Személyazonosság Generátor (PID)</h2>
+            <p class="text-gray-400 mb-6">
+                A profil adatok és az S_T pontszám alapján generál 5 valószínű nevet és születési dátumot.
+            </p>
+            <div class="text-center mb-6">
+                <button id="generateIdButton" onclick="generatePotentialIdentities()" class="btn-primary text-rps-light font-bold py-3 px-8 rounded-lg flex items-center justify-center mx-auto" style="--accent-color: #10b981;">
+                    <svg id="idIcon" class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                    <svg id="idLoadingIcon" class="w-6 h-6 mr-3 hidden animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.98 8.98 0 0110 21a9 9 0 005.626-2.5l2.257 2.257A1 1 0 0021 21a10 10 0 01-20 0"></path></svg>
+                    <span>5 Potenciális Személyazonosság Generálása</span>
+                </button>
+            </div>
+
+            <div id="idResultsPanel" class="mt-4">
+                <div id="idStatusMessage" class="text-rps-danger font-medium mb-3 text-center"></div>
+                
+                <table class="min-w-full divide-y divide-gray-700 rounded-lg overflow-hidden">
+                    <thead class="bg-gray-700">
+                        <tr>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Valószínű Név</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Születési Dátum</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider hidden lg:table-cell">Indoklás (Racionálé)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="identitiesTableBody" class="bg-gray-800 divide-y divide-gray-700">
+                        <!-- Adatok ide kerülnek -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- 4. Kvantum-Kivetítés / Tér-Idő Analízis (ESzK) -->
+        <div class="rps-card accent-warn rounded-xl p-6 sm:p-8">
+            <h2 class="text-3xl font-bold text-rps-light mb-6">4. Kvantum-Kivetítés / Tér-Idő Analízis (ESzK)</h2>
+            <p class="text-gray-400 mb-6">
+                A "Circle-Logos" elvek alapján generált feltételezett tartózkodási kvantumpontok vizuális kivetítése.
+            </p>
+            
+            <div class="text-center mb-6">
+                <button id="projectionButton" onclick="generateProjectionPoints()" class="btn-primary text-rps-light font-bold py-3 px-8 rounded-lg flex items-center justify-center mx-auto" style="--accent-color: #f59e0b;">
+                    <svg id="projectionIcon" class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                    <svg id="projectionLoadingIcon" class="w-6 h-6 mr-3 hidden animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.98 8.98 0 0110 21a9 9 0 005.626-2.5l2.257 2.257A1 1 0 0021 21a10 10 0 01-20 0"></path></svg>
+                    <span>Kvantumpontok Kivetítése (ESzK)</span>
+                </button>
+            </div>
+            
+            <!-- Térkép Kivetítési Konténer (KÉP alapú) -->
+            <div id="mapContainer" class="w-full h-[400px] bg-gray-800 my-6 relative">
+                <!-- Kép és a piros pontok ide kerülnek JS-ből -->
+            </div>
+
+            <h3 class="text-xl font-semibold text-gray-300 mb-3 mt-8 border-t border-gray-700 pt-4">Generált Zóna Koordináták</h3>
+            <div id="projectionTable" class="text-gray-500">
+                <p>A tér-idő kivetítés eredményei a generálás után fognak itt megjelenni.</p>
+            </div>
+        </div>
+        
+        <!-- 5. Kapcsolat- és Összehasonlító Elemzés (KÖE) -->
+        <div class="rps-card accent-danger rounded-xl p-6 sm:p-8">
+            <h2 class="text-3xl font-bold text-rps-light mb-6">5. Kapcsolat- és Összehasonlító Elemzés (KÖE)</h2>
+            <p class="text-gray-400 mb-6">
+                Elemezi a 3. pontban generált PID-ek közötti összefüggéseket és az eredeti profilhoz való illeszkedést.
+            </p>
+            <div class="text-center mb-6">
+                <button id="comparisonButton" onclick="generateComparisonAnalysis()" class="btn-primary text-rps-light font-bold py-3 px-8 rounded-lg flex items-center justify-center mx-auto" style="--accent-color: #ef4444;">
+                    <svg id="comparisonIcon" class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M12 20.646l4.243-4.243a8 8 0 10-11.314 0z"></path></svg>
+                    <svg id="comparisonLoadingIcon" class="w-6 h-6 mr-3 hidden animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.98 8.98 0 0110 21a9 9 0 005.626-2.5l2.257 2.257A1 1 0 0021 21a10 10 0 01-20 0"></path></svg>
+                    <span>Kapcsolat-Elemzés (KÖE) Futtatása</span>
+                </button>
+            </div>
+
+            <div id="comparisonStatusMessage" class="text-gray-400 font-medium mb-3 text-center"></div>
+            <div id="comparisonResultsPanel" class="mt-4 text-gray-500">
+                <p>A kapcsolati elemzés a PID generálása után indítható.</p>
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>
